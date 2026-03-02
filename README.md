@@ -59,12 +59,44 @@ memory_update() / memory_delete()
 
 ## Installation
 
+### 1. Install dependencies
+
 ```bash
 cd /path/to/claude_mem
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
+
+`pip install` brings in everything automatically. Key transitive dependencies pulled in by `sentence-transformers`:
+
+| Package | Why |
+|---------|-----|
+| `torch` | Required by sentence-transformers for model inference |
+| `transformers` | HuggingFace model loading |
+| `huggingface-hub` | Model download and caching |
+| `numpy` | Cosine similarity computation for vector search |
+
+### 2. Pre-download the embedding model (one-time, requires internet)
+
+The embedding model (`all-MiniLM-L6-v2`, ~90 MB) is downloaded from HuggingFace on first use. Run this once after `pip install` so the model is ready before the first `memory_confirm`:
+
+```bash
+python memory_manager.py memory-warmup
+```
+
+Output:
+```
+Downloading embedding model all-MiniLM-L6-v2 from HuggingFace...
+Model will be cached at ~/.cache/huggingface/hub/
+
+Model ready. Embedding dim: 384
+The MCP server will now load this model offline on first confirm.
+```
+
+After this, the system is **fully offline** — no network required for normal operation. The model is loaded lazily on the first `memory_confirm` call in each server session.
+
+> **Note:** No HuggingFace account or token is required. `all-MiniLM-L6-v2` is a public model.
 
 ## Setting Up a Project
 

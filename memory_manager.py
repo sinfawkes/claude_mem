@@ -728,5 +728,28 @@ def memory_init(
     console.print(f"\n[bold green]Done.[/bold green] Restart Claude Code in [bold]{abs_path}[/bold] to activate memory.\n")
 
 
+@app.command()
+def memory_warmup(
+    model: str = typer.Option("all-MiniLM-L6-v2", "--model", help="Embedding model to pre-download"),
+) -> None:
+    """
+    Pre-download the embedding model from HuggingFace.
+
+    Run once after pip install so the model is cached locally before the first
+    memory_confirm call. Subsequent runs and MCP server restarts are fully offline.
+    """
+    console.print(f"Downloading embedding model [bold]{model}[/bold] from HuggingFace...")
+    console.print("[dim]Model will be cached at ~/.cache/huggingface/hub/[/dim]\n")
+    try:
+        from sentence_transformers import SentenceTransformer
+        m = SentenceTransformer(model)
+        test_vec = m.encode("warmup", normalize_embeddings=True)
+        console.print(f"[green]Model ready.[/green] Embedding dim: {test_vec.shape[0]}")
+        console.print("[dim]The MCP server will now load this model offline on first confirm.[/dim]")
+    except Exception as exc:
+        console.print(f"[red]Download failed:[/red] {exc}")
+        raise typer.Exit(1)
+
+
 if __name__ == "__main__":
     app()
