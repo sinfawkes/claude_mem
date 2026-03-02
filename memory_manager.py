@@ -655,5 +655,78 @@ def memory_index(
     console.print(f"Inserted [green]{inserted}[/green] proposed memories")
 
 
+@app.command()
+def memory_init(
+    project_path: str = typer.Argument(..., help="Absolute path to the project root"),
+    project_name: Optional[str] = typer.Option(None, "--name", "-n", help="Project name (defaults to directory name)"),
+    db_filename: str = typer.Option("project_memory.db", "--db-filename", help="DB filename placed inside the project root"),
+) -> None:
+    """
+    Bootstrap memory for a new project.
+
+    Creates project_memory.db inside the project root, writes .claude.json,
+    and adds the DB file to .gitignore.
+    """
+    abs_path = os.path.expanduser(project_path)
+    if not os.path.isdir(abs_path):
+        console.print(f"[red]Directory not found: {abs_path}[/red]")
+        raise typer.Exit(1)
+
+    name = project_name or os.path.basename(abs_path.rstrip("/"))
+    db_path = os.path.join(abs_path, db_filename)
+    server_py = os.path.abspath(os.path.join(os.path.dirname(__file__), "server.py"))
+    venv_python = os.path.abspath(os.path.join(os.path.dirname(__file__), ".venv", "bin", "python"))
+
+    claude_json = {
+        "mcpServers": {
+            "memory": {
+                "command": venv_python,
+                "args": [server_py],
+                "env": {
+                    "MEMORY_DB_PATH": db_path,
+                    "PROJECT_PATH": abs_path,
+                    "GIT_ROOT": abs_path,
+                },
+            }
+        }
+    }
+
+    console.print(f"\n[bold]Project:[/bold] {name}")
+    console.print(f"[bold]DB:[/bold]      {db_path}")
+
+    # Write .claude.json
+    claude_json_path = os.path.join(abs_path, ".claude.json")
+    if os.path.exists(claude_json_path):
+        console.print(f"\n[yellow].claude.json already exists at {claude_json_path}[/yellow]")
+        console.print("Merge this snippet into it manually:\n")
+        console.print(json.dumps(claude_json, indent=2))
+    else:
+        write_it = typer.confirm(f"\nWrite .claude.json to {claude_json_path}?", default=True)
+        if write_it:
+            with open(claude_json_path, "w", encoding="utf-8") as f:
+                json.dump(claude_json, f, indent=2)
+                f.write("\n")
+            console.print(f"[green]Written:[/green] {claude_json_path}")
+
+    # Add DB file to .gitignore
+    gitignore_path = os.path.join(abs_path, ".gitignore")
+    gitignore_entry = f"{db_filename}\n"
+    already_ignored = False
+    if os.path.exists(gitignore_path):
+        with open(gitignore_path, encoding="utf-8") as f:
+            already_ignored = db_filename in f.read()
+
+    if already_ignored:
+        console.print(f"[dim]{db_filename} already in .gitignore[/dim]")
+    else:
+        add_gitignore = typer.confirm(f"Add {db_filename} to .gitignore?", default=True)
+        if add_gitignore:
+            with open(gitignore_path, "a", encoding="utf-8") as f:
+                f.write(f"\n# Claude Code memory DB\n{gitignore_entry}")
+            console.print(f"[green]Added[/green] {db_filename} to .gitignore")
+
+    console.print(f"\n[bold green]Done.[/bold green] Restart Claude Code in [bold]{abs_path}[/bold] to activate memory.\n")
+
+
 if __name__ == "__main__":
     app()
