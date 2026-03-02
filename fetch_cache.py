@@ -3,7 +3,8 @@ Tiered fetch architecture for memory retrieval.
 
 Tier 1: In-process LRU cache (hot memories per session)
 Tier 2: SQL pre-filter (project/type/tags/status) — narrows candidate set
-Tier 3: Vector similarity search on the filtered candidate IDs
+Tier 3: Vector similarity search on the filtered candidate IDs (falls back to
+        LIKE text search when no embeddings DB is configured)
 """
 
 from __future__ import annotations
@@ -21,8 +22,16 @@ logger = logging.getLogger(__name__)
 class MemoryFetchCache:
     """Three-tier memory fetch: L1 LRU → L2 SQL pre-filter → L3 vector search."""
 
-    def __init__(self, db_path: str, max_lru_size: int = 100):
+    def __init__(
+        self,
+        db_path: str,
+        max_lru_size: int = 100,
+        embeddings_db_path: Optional[str] = None,
+        embedding_model: str = "all-MiniLM-L6-v2",
+    ):
         self._db_path = db_path
+        self._embeddings_db_path = embeddings_db_path
+        self._embedding_model = embedding_model
         self._l1: LRUCache = LRUCache(maxsize=max_lru_size)
 
     def _get_connection(self) -> sqlite3.Connection:
@@ -88,16 +97,52 @@ class MemoryFetchCache:
                 matched.append(row["id"])
         return matched
 
-    def text_search(
+    def _vector_search(
         self,
         query: str,
         candidate_ids: list[str],
-        top_k: int = 10,
+        top_k: int,
     ) -> list[dict]:
-        """
-        L3 (text fallback): LIKE-based search on the candidate ID set.
-        This is replaced by vector search once sqlite-vec is wired in.
-        """
+        """L3: semantic vector search over the candidate set."""
+        import vector_store
+
+        ranked = vector_store.vector_search(
+            db_path=self._embeddings_db_path,
+            query=query,
+            candidate_ids=candidate_ids,
+            top_k=top_k,
+            model_name=self._embedding_model,
+        )
+        if not ranked:
+            return []
+
+        ranked_ids = [mid for mid, _ in ranked]
+        scores = {mid: score for mid, score in ranked}
+
+        placeholders = ",".join("?" * len(ranked_ids))
+        with self._get_connection() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM memories WHERE id IN ({placeholders})",
+                ranked_ids,
+            ).fetchall()
+
+        by_id = {row["id"]: dict(row) for row in rows}
+        results = []
+        for mid in ranked_ids:
+            if mid in by_id:
+                entry = by_id[mid]
+                entry["similarity_score"] = round(scores[mid], 4)
+                self._l1[mid] = entry
+                results.append(entry)
+        return results
+
+    def _text_search(
+        self,
+        query: str,
+        candidate_ids: list[str],
+        top_k: int,
+    ) -> list[dict]:
+        """L3 fallback: LIKE-based search when no embeddings DB is configured."""
         if not candidate_ids:
             return []
 
@@ -128,7 +173,7 @@ class MemoryFetchCache:
         top_k: int = 10,
         bypass_prefilter: bool = False,
     ) -> list[dict]:
-        """Full tiered search: L2 pre-filter → L3 text/vector search."""
+        """Full tiered search: L2 pre-filter → L3 vector (or text fallback)."""
         if bypass_prefilter:
             candidate_ids = self._all_confirmed_ids()
         else:
@@ -138,7 +183,12 @@ class MemoryFetchCache:
                 len(candidate_ids), project, type_filter, tags,
             )
 
-        return self.text_search(query, candidate_ids, top_k)
+        if self._embeddings_db_path:
+            logger.debug("L3: vector search over %d candidates", len(candidate_ids))
+            return self._vector_search(query, candidate_ids, top_k)
+
+        logger.debug("L3: text fallback search (no embeddings DB configured)")
+        return self._text_search(query, candidate_ids, top_k)
 
     def _all_confirmed_ids(self) -> list[str]:
         with self._get_connection() as conn:

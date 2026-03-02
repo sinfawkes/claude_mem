@@ -4,14 +4,15 @@
 
 A persistent memory system for Claude Code that stores code patterns, conventions, architecture decisions, and other project knowledge. Memories are proposed by automated indexing or by the model during sessions, then confirmed by humans before being added to the search index. Memories are anchored to git commits for staleness detection when referenced files change.
 
-Each project keeps its own `project_memory.db` file inside the project root, making memory self-contained and portable alongside the code.
+Each project keeps its own `project_memory.db` and `project_embeddings.db` inside the project root, making memory self-contained and portable alongside the code. Confirmed memories are indexed with real semantic embeddings (`all-MiniLM-L6-v2`, 384 dims) so search finds relevant results by meaning, not just keyword matching.
 
 ## Architecture
 
-- **Three-tier fetch**: L1 in-process LRU cache → L2 SQL pre-filter (project/type/status) → L3 text/vector search on candidates
-- **Human-in-the-loop**: Proposed memories require `memory_confirm` before appearing in search; rejected entries are archived
-- **Git-anchored versioning**: `git_commit_hash` and `files` enable staleness checks when code changes
-- **Per-project DB**: `project_memory.db` lives inside the project root, gitignored, isolated from other projects
+- **Three-tier fetch**: L1 in-process LRU cache → L2 SQL pre-filter (project/type/status) → L3 semantic vector search
+- **Real semantic search**: confirmed memories are embedded with `all-MiniLM-L6-v2` (384 dims); search finds relevant results by meaning, not just keywords
+- **Human-in-the-loop**: proposed memories require `memory_confirm` before entering the search index; rejected entries are archived
+- **Git-anchored versioning**: `git_commit_hash` and `files` enable staleness detection when code changes
+- **Per-project isolation**: `project_memory.db` and `project_embeddings.db` live inside the project root, gitignored
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -20,18 +21,40 @@ Each project keeps its own `project_memory.db` file inside the project root, mak
                                     │
         ┌───────────────────────────┼───────────────────────────┐
         ▼                           ▼                           ▼
-   ┌─────────┐               ┌─────────────┐             ┌─────────────┐
-   │   L1    │  cache miss   │     L2      │  candidates │     L3      │
-   │  LRU    │ ───────────▶  │ SQL filter  │ ──────────▶│ text/vector │
-   │  cache  │               │ project/    │             │   search    │
-   └─────────┘               │ type/tags   │             └─────────────┘
-        ▲                    └─────────────┘
-        │                            │
-        │                            ▼
-        │                     ┌─────────────┐
-        └─────────────────────│   SQLite    │
-              cache hit       │  memories   │
-                              └─────────────┘
+   ┌─────────┐               ┌─────────────┐             ┌──────────────────┐
+   │   L1    │  cache miss   │     L2      │  candidates │       L3         │
+   │  LRU    │ ───────────▶  │ SQL filter  │ ──────────▶│  cosine similarity│
+   │  cache  │               │ project/    │             │  (NumPy + BLOB   │
+   └─────────┘               │ type/tags   │             │   embeddings)    │
+        ▲                    └─────────────┘             └──────────────────┘
+        │                            │                           │
+        │                            ▼                           ▼
+        │                     ┌─────────────┐         ┌──────────────────┐
+        └─────────────────────│  memories   │         │  embeddings      │
+              cache hit       │  .db        │         │  .db             │
+                              └─────────────┘         └──────────────────┘
+```
+
+### Embedding lifecycle
+
+```
+memory_confirm()
+      │
+      ▼
+sentence-transformers encodes content   →   384-dim float32 vector
+      │
+      ▼
+stored in project_embeddings.db (BLOB)
+      │
+memory_search(query)
+      │
+      ├─ L2 SQL pre-filter → candidate IDs
+      ├─ load candidate embeddings from embeddings.db
+      ├─ encode query → query vector
+      └─ cosine similarity → ranked results with similarity_score
+
+memory_update() / memory_delete()
+      └─ embedding removed from embeddings.db immediately
 ```
 
 ## Installation
@@ -67,8 +90,9 @@ After init, each project looks like this:
 
 ```
 your_project/
-  ├── project_memory.db     ← memory DB, gitignored
-  ├── .claude.json          ← MCP server registration
+  ├── project_memory.db       ← memory DB (entries, versions, knowledge graph), gitignored
+  ├── project_embeddings.db   ← vector embeddings for confirmed memories, gitignored
+  ├── .claude.json            ← MCP server registration
   └── ...
 ```
 
@@ -112,13 +136,13 @@ All variables are set per-project inside `.claude.json` (via `memory-init`). You
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MEMORY_DB_PATH` | — | Path to the project's `project_memory.db` (set by `memory-init`) |
-| `EMBEDDINGS_DB_PATH` | — | Path to vector embeddings DB (optional, for future vector search) |
+| `MEMORY_DB_PATH` | — | Path to `project_memory.db` (set by `memory-init`) |
+| `EMBEDDINGS_DB_PATH` | auto: same dir as `MEMORY_DB_PATH`, named `project_embeddings.db` | Override path for the vector embeddings DB |
 | `PROJECT_PATH` | — | Project directory root |
 | `GIT_ROOT` | — | Git repository root for staleness detection |
-| `EMBEDDING_MODEL` | `all-MiniLM-L6-v2` | sentence-transformers model for vector embeddings |
-| `MAX_LRU_CACHE_SIZE` | `100` | Maximum entries in the L1 in-process cache per session |
-| `PROPOSAL_RATE_LIMIT_PER_MINUTE` | `10` | Max auto-indexer proposals per minute (prevents flooding) |
+| `EMBEDDING_MODEL` | `all-MiniLM-L6-v2` | sentence-transformers model (384 dims); loaded lazily on first confirm |
+| `MAX_LRU_CACHE_SIZE` | `100` | Maximum confirmed memories held in the L1 in-process cache per session |
+| `PROPOSAL_RATE_LIMIT_PER_MINUTE` | `10` | Max auto-indexer proposals per minute (prevents flooding on large scans) |
 | `PROPOSAL_TTL_DAYS` | `7` | Days before unreviewed proposed entries are auto-expired |
 
 ## Global Claude Code Instruction
@@ -228,11 +252,12 @@ pytest tests/ -v --tb=short
 
 | File | Description |
 |------|-------------|
-| `server.py` | FastMCP server — all MCP tools, SQLite schema, type normalisation |
+| `server.py` | FastMCP server — all MCP tools, SQLite schema, type normalisation, embedding lifecycle |
 | `config.py` | Pydantic v2 models: `MemoryEntry`, `MemoryMetadata`, `MemorySearchQuery` |
-| `fetch_cache.py` | L1 LRU cache + L2 SQL pre-filter + L3 text/vector search |
+| `fetch_cache.py` | L1 LRU cache + L2 SQL pre-filter + L3 cosine similarity search |
+| `vector_store.py` | Embedding generation (`sentence-transformers`), BLOB storage, `vector_search()` |
 | `knowledge_graph.py` | NetworkX digraph tracking memory–file relationships |
 | `memory_indexer.py` | Project file scanner — proposes entries, never auto-confirms |
 | `staleness.py` | Git-based staleness detection via `git log` diff |
 | `memory_manager.py` | Typer CLI for all memory operations |
-| `tests/` | Unit tests for models, fetch tiers, and staleness logic |
+| `tests/` | Unit tests for models, fetch tiers, staleness logic, and vector store |

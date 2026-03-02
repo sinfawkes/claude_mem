@@ -18,6 +18,7 @@ from fastmcp import FastMCP
 from config import AppConfig, MemorySource, MemoryStatus, MemoryType
 from fetch_cache import MemoryFetchCache
 from knowledge_graph import KnowledgeGraph
+import vector_store
 
 load_dotenv()
 
@@ -105,8 +106,27 @@ config = _load_config()
 conn = _get_conn(config)
 _init_db(conn)
 
+# Derive embeddings DB path: same directory as memory DB, named project_embeddings.db
+# unless explicitly set via EMBEDDINGS_DB_PATH
+_embeddings_db_path: str | None = None
+_raw_embeddings_env = os.environ.get("EMBEDDINGS_DB_PATH", "")
+if _raw_embeddings_env:
+    _embeddings_db_path = os.path.expanduser(_raw_embeddings_env)
+else:
+    _embeddings_db_path = os.path.join(
+        os.path.dirname(config.memory_db_path), "project_embeddings.db"
+    )
+
+vector_store.init_db(_embeddings_db_path)
+logger.info("Embeddings DB: %s", _embeddings_db_path)
+
 graph_path = os.path.join(os.path.dirname(config.memory_db_path), "knowledge_graph.pkl")
-fetch_cache = MemoryFetchCache(config.memory_db_path, max_lru_size=config.max_lru_cache_size)
+fetch_cache = MemoryFetchCache(
+    config.memory_db_path,
+    max_lru_size=config.max_lru_cache_size,
+    embeddings_db_path=_embeddings_db_path,
+    embedding_model=config.embedding_model,
+)
 knowledge_graph = KnowledgeGraph(graph_path)
 
 _proposal_timestamps: deque[float] = deque(maxlen=config.proposal_rate_limit_per_minute * 2)
@@ -258,7 +278,15 @@ async def memory_confirm(id: str) -> dict:
     conn.commit()
 
     fetch_cache.invalidate(id)
-    files = json.loads(row["files"]) if row["files"] else []
+
+    # Generate and store the embedding for semantic search
+    try:
+        vector_store.add_embedding(_embeddings_db_path, id, content, config.embedding_model)
+    except Exception as exc:
+        logger.warning("Could not generate embedding for %s: %s", id, exc)
+
+    files_raw = conn.execute("SELECT files FROM memories WHERE id = ?", (id,)).fetchone()
+    files = json.loads(files_raw["files"]) if files_raw and files_raw["files"] else []
     if files:
         knowledge_graph.link_memory_to_files(id, files)
         knowledge_graph.save()
@@ -357,6 +385,13 @@ async def memory_update(
     conn.commit()
     fetch_cache.invalidate(id)
 
+    # Revert-to-proposed removes the embedding; it will be re-generated on next confirm
+    if old_status == MemoryStatus.CONFIRMED.value:
+        try:
+            vector_store.remove_embedding(_embeddings_db_path, id)
+        except Exception as exc:
+            logger.warning("Could not remove embedding for %s: %s", id, exc)
+
     return {
         "id": id,
         "status": MemoryStatus.PROPOSED.value if old_status == MemoryStatus.CONFIRMED.value else old_status,
@@ -369,6 +404,10 @@ async def memory_delete(id: str) -> dict:
     """Hard delete a memory from the memories table. memory_versions is retained for audit."""
     conn.execute("DELETE FROM memories WHERE id = ?", (id,))
     conn.commit()
+    try:
+        vector_store.remove_embedding(_embeddings_db_path, id)
+    except Exception as exc:
+        logger.warning("Could not remove embedding for %s: %s", id, exc)
     return {"id": id, "deleted": True}
 
 
