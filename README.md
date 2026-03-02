@@ -14,6 +14,31 @@ Each project keeps its own `project_memory.db` and `project_embeddings.db` insid
 - **Git-anchored versioning**: `git_commit_hash` and `files` enable staleness detection when code changes
 - **Per-project isolation**: `project_memory.db` and `project_embeddings.db` live inside the project root, gitignored
 
+### What is the LRU cache?
+
+LRU stands for **Least Recently Used**. It is a fixed-size in-memory store that automatically evicts the entry you used longest ago when it is full.
+
+```
+Session starts, cache size = 3:
+
+Access "battle":   [battle]
+Access "render":   [battle, render]
+Access "network":  [battle, render, network]   ← full
+
+Access "audio":    [render, network, audio]    ← "battle" evicted (oldest)
+Access "render":   [network, audio, render]    ← "render" promoted (just used)
+```
+
+Every `memory_search` normally runs SQL + cosine similarity over embeddings (~50ms). The L1 LRU cache (100 slots by default) short-circuits that for repeated lookups within a session:
+
+```
+memory_search("battle command")
+  └─ L1 hit?  → return immediately (RAM only, no DB, no embeddings)
+  └─ L1 miss? → L2 SQL filter → L3 vector search → store result in L1
+```
+
+When the 101st unique memory is accessed, the least recently touched one is dropped — it is fetched from SQLite again if needed later. For typical project-scale usage the cache rarely evicts anything within a single session. Tune with `MAX_LRU_CACHE_SIZE` in your `.env`.
+
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                        memory_search                             │
