@@ -21,6 +21,7 @@ from rich import print as rprint
 from config import MemoryType, MemoryStatus, MemorySource
 from staleness import check_all_memories_staleness, is_git_repo
 from memory_indexer import MemoryIndexer
+import vector_store as vs
 
 load_dotenv()
 
@@ -67,6 +68,21 @@ CREATE TABLE IF NOT EXISTS memory_versions (
 def _get_db_path() -> str:
     path = os.environ.get("MEMORY_DB_PATH", "~/.claude-memory/data/memory.db")
     return os.path.expanduser(path)
+
+
+def _get_embeddings_db_path() -> str:
+    path = os.environ.get("EMBEDDINGS_DB_PATH", "")
+    if path:
+        return os.path.expanduser(path)
+    # Derive from MEMORY_DB_PATH: replace .db suffix with _embeddings.db
+    mem_path = _get_db_path()
+    if mem_path.endswith(".db"):
+        return mem_path[:-3] + "_embeddings.db"
+    return mem_path + "_embeddings.db"
+
+
+def _get_embedding_model() -> str:
+    return os.environ.get("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
 
 
 def _get_git_root() -> str:
@@ -180,6 +196,11 @@ def memory_add(
     )
     conn.commit()
     conn.close()
+
+    emb_path = _get_embeddings_db_path()
+    vs.init_db(emb_path)
+    vs.add_embedding(emb_path, memory_id, content.strip(), _get_embedding_model())
+
     console.print(f"Added and confirmed memory [green]{memory_id}[/green] (type: {type.value})")
 
 
@@ -277,6 +298,11 @@ def memory_confirm(
     )
     conn.commit()
     conn.close()
+
+    emb_path = _get_embeddings_db_path()
+    vs.init_db(emb_path)
+    vs.add_embedding(emb_path, id, row["content"], _get_embedding_model())
+
     console.print(f"Confirmed memory [green]{id}[/green]")
 
 
@@ -313,7 +339,11 @@ def memory_search(
     from fetch_cache import MemoryFetchCache
 
     db_path = _get_db_path()
-    fetch_cache = MemoryFetchCache(db_path)
+    fetch_cache = MemoryFetchCache(
+        db_path,
+        embeddings_db_path=_get_embeddings_db_path(),
+        embedding_model=_get_embedding_model(),
+    )
     type_list = [type_filter.value] if type_filter else None
     rows = fetch_cache.search(
         query=query,
@@ -659,13 +689,13 @@ def memory_index(
 def memory_init(
     project_path: str = typer.Argument(..., help="Absolute path to the project root"),
     project_name: Optional[str] = typer.Option(None, "--name", "-n", help="Project name (defaults to directory name)"),
-    db_filename: str = typer.Option("project_memory.db", "--db-filename", help="DB filename placed inside the project root"),
+    db_filename: str = typer.Option("project_memory.db", "--db-filename", help="Memory DB filename placed inside the project root"),
 ) -> None:
     """
     Bootstrap memory for a new project.
 
-    Creates project_memory.db inside the project root, writes .claude.json,
-    and adds the DB file to .gitignore.
+    Writes .mcp.json to the project root (Claude Code reads this for MCP server
+    config), creates both DB files, and adds them to .gitignore.
     """
     abs_path = os.path.expanduser(project_path)
     if not os.path.isdir(abs_path):
@@ -673,17 +703,27 @@ def memory_init(
         raise typer.Exit(1)
 
     name = project_name or os.path.basename(abs_path.rstrip("/"))
+
+    # Derive both DB paths inside the project root
+    if db_filename.endswith(".db"):
+        emb_filename = db_filename[:-3] + "_embeddings.db"
+    else:
+        emb_filename = db_filename + "_embeddings.db"
+
     db_path = os.path.join(abs_path, db_filename)
+    emb_path = os.path.join(abs_path, emb_filename)
+
     server_py = os.path.abspath(os.path.join(os.path.dirname(__file__), "server.py"))
     venv_python = os.path.abspath(os.path.join(os.path.dirname(__file__), ".venv", "bin", "python"))
 
-    claude_json = {
+    mcp_config = {
         "mcpServers": {
             "memory": {
                 "command": venv_python,
                 "args": [server_py],
                 "env": {
                     "MEMORY_DB_PATH": db_path,
+                    "EMBEDDINGS_DB_PATH": emb_path,
                     "PROJECT_PATH": abs_path,
                     "GIT_ROOT": abs_path,
                 },
@@ -691,39 +731,74 @@ def memory_init(
         }
     }
 
-    console.print(f"\n[bold]Project:[/bold] {name}")
-    console.print(f"[bold]DB:[/bold]      {db_path}")
+    console.print(f"\n[bold]Project:[/bold]        {name}")
+    console.print(f"[bold]Memory DB:[/bold]      {db_path}")
+    console.print(f"[bold]Embeddings DB:[/bold]  {emb_path}")
 
-    # Write .claude.json
-    claude_json_path = os.path.join(abs_path, ".claude.json")
-    if os.path.exists(claude_json_path):
-        console.print(f"\n[yellow].claude.json already exists at {claude_json_path}[/yellow]")
+    # Write .mcp.json — this is the file Claude Code reads for project MCP servers
+    mcp_json_path = os.path.join(abs_path, ".mcp.json")
+    if os.path.exists(mcp_json_path):
+        console.print(f"\n[yellow].mcp.json already exists at {mcp_json_path}[/yellow]")
         console.print("Merge this snippet into it manually:\n")
-        console.print(json.dumps(claude_json, indent=2))
+        console.print(json.dumps(mcp_config, indent=2))
     else:
-        write_it = typer.confirm(f"\nWrite .claude.json to {claude_json_path}?", default=True)
+        write_it = typer.confirm(f"\nWrite .mcp.json to {mcp_json_path}?", default=True)
         if write_it:
-            with open(claude_json_path, "w", encoding="utf-8") as f:
-                json.dump(claude_json, f, indent=2)
+            with open(mcp_json_path, "w", encoding="utf-8") as f:
+                json.dump(mcp_config, f, indent=2)
                 f.write("\n")
-            console.print(f"[green]Written:[/green] {claude_json_path}")
+            console.print(f"[green]Written:[/green] {mcp_json_path}")
 
-    # Add DB file to .gitignore
+    # Add DB files and .mcp.json to .gitignore (paths are machine-local)
     gitignore_path = os.path.join(abs_path, ".gitignore")
-    gitignore_entry = f"{db_filename}\n"
-    already_ignored = False
+    entries_to_ignore = [db_filename, emb_filename, ".mcp.json"]
+    existing_content = ""
     if os.path.exists(gitignore_path):
         with open(gitignore_path, encoding="utf-8") as f:
-            already_ignored = db_filename in f.read()
+            existing_content = f.read()
 
-    if already_ignored:
-        console.print(f"[dim]{db_filename} already in .gitignore[/dim]")
+    missing = [e for e in entries_to_ignore if e not in existing_content]
+    if not missing:
+        console.print("[dim]All entries already in .gitignore[/dim]")
     else:
-        add_gitignore = typer.confirm(f"Add {db_filename} to .gitignore?", default=True)
+        add_gitignore = typer.confirm(
+            f"Add {', '.join(missing)} to .gitignore?", default=True
+        )
         if add_gitignore:
             with open(gitignore_path, "a", encoding="utf-8") as f:
-                f.write(f"\n# Claude Code memory DB\n{gitignore_entry}")
-            console.print(f"[green]Added[/green] {db_filename} to .gitignore")
+                f.write("\n# Claude Code memory (machine-local, do not commit)\n")
+                for entry in missing:
+                    f.write(f"{entry}\n")
+            console.print(f"[green]Added[/green] {', '.join(missing)} to .gitignore")
+
+    # Offer to write .env for the CLI tool (claude_mem directory)
+    cli_dir = os.path.dirname(os.path.abspath(__file__))
+    env_path = os.path.join(cli_dir, ".env")
+    env_content = (
+        f"MEMORY_DB_PATH={db_path}\n"
+        f"EMBEDDINGS_DB_PATH={emb_path}\n"
+        f"PROJECT_PATH={abs_path}\n"
+        f"GIT_ROOT={abs_path}\n"
+        f"EMBEDDING_MODEL=all-MiniLM-L6-v2\n"
+        f"MAX_LRU_CACHE_SIZE=100\n"
+        f"PROPOSAL_RATE_LIMIT_PER_MINUTE=10\n"
+        f"PROPOSAL_TTL_DAYS=7\n"
+    )
+    if os.path.exists(env_path):
+        console.print(f"\n[yellow].env already exists at {env_path}[/yellow]")
+        overwrite = typer.confirm("Overwrite it with paths for this project?", default=False)
+        if overwrite:
+            with open(env_path, "w", encoding="utf-8") as f:
+                f.write(env_content)
+            console.print(f"[green]Updated:[/green] {env_path}")
+        else:
+            console.print("[dim]Skipped .env (update it manually if needed)[/dim]")
+    else:
+        write_env = typer.confirm(f"\nWrite .env to {env_path} (for CLI tool)?", default=True)
+        if write_env:
+            with open(env_path, "w", encoding="utf-8") as f:
+                f.write(env_content)
+            console.print(f"[green]Written:[/green] {env_path}")
 
     console.print(f"\n[bold green]Done.[/bold green] Restart Claude Code in [bold]{abs_path}[/bold] to activate memory.\n")
 
