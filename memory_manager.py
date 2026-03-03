@@ -689,13 +689,13 @@ def memory_index(
 def memory_init(
     project_path: str = typer.Argument(..., help="Absolute path to the project root"),
     project_name: Optional[str] = typer.Option(None, "--name", "-n", help="Project name (defaults to directory name)"),
-    db_filename: str = typer.Option("project_memory.db", "--db-filename", help="Memory DB filename placed inside the project root"),
+    db_filename: str = typer.Option("project_memory.db", "--db-filename", help="Memory DB filename inside .claude_mem/"),
 ) -> None:
     """
     Bootstrap memory for a new project.
 
-    Writes .mcp.json to the project root (Claude Code reads this for MCP server
-    config), creates both DB files, and adds them to .gitignore.
+    Creates <project>/.claude_mem/ with both DB files, writes .mcp.json to the
+    project root, and adds .claude_mem/ to .gitignore.
     """
     abs_path = os.path.expanduser(project_path)
     if not os.path.isdir(abs_path):
@@ -704,14 +704,17 @@ def memory_init(
 
     name = project_name or os.path.basename(abs_path.rstrip("/"))
 
-    # Derive both DB paths inside the project root
+    # DB files live under <project>/.claude_mem/
+    mem_dir = os.path.join(abs_path, ".claude_mem")
+    os.makedirs(mem_dir, exist_ok=True)
+
     if db_filename.endswith(".db"):
         emb_filename = db_filename[:-3] + "_embeddings.db"
     else:
         emb_filename = db_filename + "_embeddings.db"
 
-    db_path = os.path.join(abs_path, db_filename)
-    emb_path = os.path.join(abs_path, emb_filename)
+    db_path = os.path.join(mem_dir, db_filename)
+    emb_path = os.path.join(mem_dir, emb_filename)
 
     server_py = os.path.abspath(os.path.join(os.path.dirname(__file__), "server.py"))
     venv_python = os.path.abspath(os.path.join(os.path.dirname(__file__), ".venv", "bin", "python"))
@@ -732,6 +735,7 @@ def memory_init(
     }
 
     console.print(f"\n[bold]Project:[/bold]        {name}")
+    console.print(f"[bold]Memory dir:[/bold]     {mem_dir}/")
     console.print(f"[bold]Memory DB:[/bold]      {db_path}")
     console.print(f"[bold]Embeddings DB:[/bold]  {emb_path}")
 
@@ -749,9 +753,9 @@ def memory_init(
                 f.write("\n")
             console.print(f"[green]Written:[/green] {mcp_json_path}")
 
-    # Add DB files and .mcp.json to .gitignore (paths are machine-local)
+    # Add .claude_mem/ and .mcp.json to .gitignore (machine-local, do not commit)
     gitignore_path = os.path.join(abs_path, ".gitignore")
-    entries_to_ignore = [db_filename, emb_filename, ".mcp.json"]
+    entries_to_ignore = [".claude_mem/", ".mcp.json"]
     existing_content = ""
     if os.path.exists(gitignore_path):
         with open(gitignore_path, encoding="utf-8") as f:
